@@ -1,10 +1,11 @@
 """Local mirror server: isolation headers, byte ranges, and engine batch I/O."""
-import argparse, gzip, io, json, mimetypes, re, shutil, webbrowser
+import argparse, gzip, io, json, mimetypes, re, webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, unquote, parse_qs
 
 ROOT = Path(__file__).resolve().parent / 'mirror' / 'playgta5.com'
+SUPPORT = Path(__file__).resolve().parent / 'support'
 if not (ROOT / 'index.html').is_file():
     nested_root = ROOT.parent / 'mirror' / 'playgta5.com'
     if (nested_root / 'index.html').is_file():
@@ -12,7 +13,22 @@ if not (ROOT / 'index.html').is_file():
 mimetypes.add_type('application/wasm', '.wasm')
 mimetypes.add_type('text/javascript', '.js')
 
+def improve_game_page(code):
+    """Improve support text at serving/build time, preserving verified release files."""
+    if 'game-progress' not in code:
+        return code
+    code = code.replace(': the device may be out of memory. Close other tabs, or reload.',
+                        ': loading has paused. Use Help / browser checks and collect the first console error.')
+    code = code.replace('If the tab shows "Aw, Snap!" or SIGILL it ran out of memory.',
+                        'A tab crash needs its error details; it does not by itself prove insufficient RAM.')
+    link = '<a href="/__support/" target="_blank" rel="noopener" style="position:fixed;top:12px;right:12px;z-index:10000;background:#182621;color:#fff;padding:10px 14px;border-radius:5px;font:14px system-ui;text-decoration:none">Help / browser checks</a>'
+    return code.replace('<body>', '<body>\n' + link, 1)
+
 class Handler(SimpleHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
     def __init__(self, *args, **kwargs):
         self.byte_range = None
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -25,6 +41,28 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def send_head(self):
+        self.byte_range = None
+        if urlsplit(self.path).path in ('/', '/index.html') and (ROOT / 'index.html').is_file():
+            body = improve_game_page((ROOT / 'index.html').read_text(encoding='utf-8')).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            return io.BytesIO(body)
+        support_files = {'/__support/': 'index.html', '/__support/check.js': 'check.js'}
+        support_name = support_files.get(urlsplit(self.path).path)
+        if support_name:
+            path = SUPPORT / support_name
+            if not path.is_file():
+                self.send_error(404)
+                return None
+            self.send_response(200)
+            self.send_header('Content-Type', self.guess_type(str(path)))
+            self.send_header('Content-Length', str(path.stat().st_size))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            return path.open('rb')
         if not self.headers.get('Range'):
             return super().send_head()
         path = Path(self.translate_path(self.path))
@@ -70,9 +108,13 @@ class Handler(SimpleHTTPRequestHandler):
         if url.path != '/data/batch':
             self.send_error(404)
             return
-        length = int(self.headers.get('Content-Length', '0'))
-        if length > 1024 * 1024:
-            self.send_error(413)
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            self.send_error(400, 'Invalid Content-Length')
+            return
+        if not 0 <= length <= 1024 * 1024:
+            self.send_error(413, 'Invalid batch size')
             return
         try:
             runs = json.loads(self.rfile.read(length))
@@ -81,6 +123,8 @@ class Handler(SimpleHTTPRequestHandler):
             selected = []
             data_root = (ROOT / 'data').resolve()
             for name, start, end in runs:
+                if not isinstance(name, str) or type(start) is not int or type(end) is not int:
+                    raise ValueError('invalid file/range types')
                 file = (data_root / name).resolve()
                 if not file.is_relative_to(data_root) or start < 0 or end < start:
                     raise ValueError('invalid file/range')
@@ -111,13 +155,21 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
     args.add_argument('--port', type=int, default=8000)
-    args.add_argument('--open', action='store_true', help='open the default browser after binding')
+    args.add_argument('--root', type=Path, help='existing game directory containing index.html, b/, and data/')
+    args.add_argument('--open', action='store_true', help='open browser compatibility and launch page')
     options = args.parse_args()
-    server = ThreadingHTTPServer(('127.0.0.1', options.port), Handler)
+    if options.root:
+        ROOT = options.root.resolve()
+    if not (ROOT / 'index.html').is_file():
+        args.error('Game files are missing. Run Download-Game.cmd (Windows) or Download-Game.command (Mac) first.')
+    try:
+        server = ThreadingHTTPServer(('127.0.0.1', options.port), Handler)
+    except OSError as error:
+        args.error(f'Cannot start on port {options.port}: {error}. Close the previous game server with Ctrl+C, or choose --port 8001.')
     address = 'http://localhost:%d/' % server.server_port
     print('Local mirror: %s (Ctrl+C to stop)' % address, flush=True)
     if options.open:
-        webbrowser.open(address)
+        webbrowser.open(address + '__support/')
     try:
         server.serve_forever()
     except KeyboardInterrupt:
